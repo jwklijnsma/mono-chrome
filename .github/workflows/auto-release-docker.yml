@@ -79,12 +79,28 @@ jobs:
 
     steps:
       # ── 4. Check out upstream source at the exact commit ───────────────────
-      - name: Checkout upstream monochrome @ ${{ env.UPSTREAM_SHORT }}
+      - name: Checkout upstream monochrome @ ${{ env.UPSTREAM_SHA }}
         uses: actions/checkout@v4
         with:
           repository: monochrome-music/monochrome
           ref: ${{ env.UPSTREAM_SHA }}
           path: src
+
+      # ── 4b. Verify Dockerfile and patch lock-file copy if needed ───────────
+      #   The upstream Dockerfile does:  COPY package.json package-lock.json ./
+      #   but the repo uses Bun (bun.lock / bun.lockb, no package-lock.json).
+      #   We patch the COPY line so the build never fails on a missing file,
+      #   and print the first FROM line so we can confirm which image is used.
+      - name: Verify & patch upstream Dockerfile
+        run: |
+          DOCKERFILE=src/docker/Dockerfile
+          echo "=== First FROM line ==="
+          grep -m1 '^FROM' "$DOCKERFILE"
+          echo "=== Patching lock-file COPY ==="
+          # Replace strict copy with a wildcard that works regardless of lockfile name
+          sed -i 's/COPY package\.json package-lock\.json \.\//COPY package.json bun.lock* bun.lockb* package-lock.json* .\//' "$DOCKERFILE"
+          echo "Patched COPY line:"
+          grep 'COPY package' "$DOCKERFILE"
 
       # ── 5. Set up QEMU + Buildx for multi-arch (amd64 + arm64) ─────────────
       - name: Set up QEMU
