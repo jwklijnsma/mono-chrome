@@ -103,8 +103,8 @@ jobs:
       #   Patches applied:
       #   1. lockfile COPY: upstream copies package-lock.json but repo uses Bun
       #      (bun.lock / bun.lockb). Wildcard glob handles whichever is present.
-      #   2. git: oven/bun:alpine has no git; vite injects commit hash at build
-      #      time via `git rev-parse`. Add git to the existing apk install line.
+      #   2. VITE_COMMIT_HASH: the checkout has no .git history, so git rev-parse
+      #      fails at build time. We inject the SHA directly as a build-arg.
       - name: Verify & patch upstream Dockerfile
         run: |
           DOCKERFILE=src/docker/Dockerfile
@@ -116,18 +116,17 @@ jobs:
             's|COPY package\.json package-lock\.json \./|COPY package.json bun.lock* bun.lockb* package-lock.json* ./|' \
             "$DOCKERFILE"
 
-          # Patch 2: add git to apk so vite git-hash injection does not fail
-          sed -i \
-            's|apk add --no-cache \(.*\)|apk add --no-cache \1 git|' \
-            "$DOCKERFILE"
+          # Patch 2: inject VITE_COMMIT_HASH as a build-arg
+          #   The checkout has no .git history so git rev-parse always fails.
+          #   We pass the upstream SHA directly via --build-arg instead.
+          #   Append ARG declaration after the last existing ARG line.
+          grep -q 'VITE_COMMIT_HASH' "$DOCKERFILE" || \
+            sed -i '/^ARG SESSION_MAX_AGE/a ARG VITE_COMMIT_HASH' "$DOCKERFILE"
 
           echo "=== Patched lines ==="
           grep -E 'COPY package|apk add' "$DOCKERFILE"
 
-      # ── 8. Set up QEMU + Buildx for multi-arch (amd64 + arm64) ─────────────
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
+      # ── 8. Set up Buildx ──────────────────────────────────────────────────
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -145,7 +144,7 @@ jobs:
         with:
           context: src
           file: src/docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ env.TAG }}
@@ -163,6 +162,7 @@ jobs:
             APPWRITE_PROJECT_ID=${{ vars.APPWRITE_PROJECT_ID }}
             POCKETBASE_URL=${{ vars.POCKETBASE_URL }}
             SESSION_MAX_AGE=${{ vars.SESSION_MAX_AGE }}
+            VITE_COMMIT_HASH=${{ env.UPSTREAM_SHA }}
 
       # ── 11. Fetch upstream commit details for release notes ────────────────
       - name: Get upstream commit details
