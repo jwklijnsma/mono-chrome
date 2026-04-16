@@ -1,237 +1,223 @@
-name: Auto Release + Docker
+name: Weekly Docker Build & Release
 
 on:
-  workflow_dispatch:
   schedule:
-    # Every Monday at 04:24 UTC
-    - cron: "24 4 * * 1"
+    # Every Monday at 03:00 UTC
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: 'Force a release even if no new commits'
+        required: false
+        default: 'false'
+        type: boolean
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-  UPSTREAM_REPO: monochrome-music/monochrome
+permissions:
+  contents: write       # create releases & tags
+  packages: write       # push to GHCR
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────────
-  release:
+  check-and-release:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     outputs:
-      version: ${{ steps.semver.outputs.version }}
-      should_build: ${{ steps.check.outputs.should_release }}
+      upstream_sha: ${{ steps.upstream.outputs.sha }}
+      upstream_short: ${{ steps.upstream.outputs.short }}
+      tag: ${{ steps.tag.outputs.tag }}
+      should_release: ${{ steps.check.outputs.should_release }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # ── Pull all commits from upstream since last local tag ────────────────
-      - name: Get latest upstream commits + compute semver
-        id: semver
+      # ── 1. Get latest upstream commit ──────────────────────────────────────
+      - name: Fetch latest upstream commit
+        id: upstream
         run: |
-          # Fetch upstream commits via GitHub API
-          COMMITS_JSON=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/commits?per_page=100")
+          SHA=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/monochrome-music/monochrome/commits/main \
+            | jq -r '.sha')
+          SHORT="${SHA:0:7}"
+          echo "sha=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          echo "Upstream HEAD: $SHA ($SHORT)"
 
-          # Latest upstream commit SHA (used as unique identifier)
-          UPSTREAM_SHA=$(echo "$COMMITS_JSON" | jq -r '.[0].sha' | cut -c1-7)
-
-          # Get current local release tag (if any)
-          CURRENT_TAG=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            | jq -r '.tag_name // "none"')
-
-          echo "Current release tag: $CURRENT_TAG"
-
-          # Determine base version
-          if [ "$CURRENT_TAG" = "none" ] || [ "$CURRENT_TAG" = "null" ]; then
-            BASE="0.0.0"
-          else
-            BASE="${CURRENT_TAG#v}"
-          fi
-
-          MAJOR=$(echo "$BASE" | cut -d. -f1)
-          MINOR=$(echo "$BASE" | cut -d. -f2)
-          PATCH=$(echo "$BASE" | cut -d. -f3)
-
-          # Build commit log since last release
-          if [ "$CURRENT_TAG" = "none" ] || [ "$CURRENT_TAG" = "null" ]; then
-            LOG=$(echo "$COMMITS_JSON" | jq -r '.[].commit | "- \(.message | split("\n")[0]) (\(.author.name))"' | head -30)
-            COUNT=$(echo "$COMMITS_JSON" | jq 'length')
-          else
-            # Get commits only newer than the stored SHA in the tag message
-            LAST_SHA=$(curl -s \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-              | jq -r '.body' | grep -o 'upstream-sha: [a-f0-9]*' | awk '{print $2}')
-
-            if [ -z "$LAST_SHA" ]; then
-              LOG=$(echo "$COMMITS_JSON" | jq -r '.[].commit | "- \(.message | split("\n")[0]) (\(.author.name))"' | head -30)
-              COUNT=$(echo "$COMMITS_JSON" | jq 'length')
-            else
-              # Filter commits newer than last known SHA
-              LOG=$(echo "$COMMITS_JSON" | jq -r \
-                --arg sha "$LAST_SHA" \
-                '[.[] | select(.sha | startswith($sha) | not)] | .[].commit | "- \(.message | split("\n")[0]) (\(.author.name))"' | head -30)
-              COUNT=$(echo "$COMMITS_JSON" | jq -r \
-                --arg sha "$LAST_SHA" \
-                '[.[] | select(.sha | startswith($sha) | not)] | length')
-            fi
-          fi
-
-          echo "New commits: $COUNT"
-          echo "Latest upstream SHA: $UPSTREAM_SHA"
-
-          # Semver bump logic:
-          #   breaking in commit message → MAJOR
-          #   10+ new commits            → MINOR
-          #   otherwise                  → PATCH
-          if echo "$LOG" | grep -qi "breaking\|BREAKING"; then
-            MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0
-            BUMP="major"
-          elif [ "$COUNT" -ge 10 ]; then
-            MINOR=$((MINOR + 1)); PATCH=0
-            BUMP="minor"
-          else
-            PATCH=$((PATCH + 1))
-            BUMP="patch"
-          fi
-
-          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
-
-          echo "version=$NEW_TAG"          >> "$GITHUB_OUTPUT"
-          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
-          echo "bump=$BUMP"                >> "$GITHUB_OUTPUT"
-          echo "commit_count=$COUNT"       >> "$GITHUB_OUTPUT"
-
-          # Write release notes to file
-          {
-            echo "## 🚀 Release $NEW_TAG"
-            echo ""
-            echo "Bump type: **$BUMP** · $COUNT new upstream commits"
-            echo ""
-            echo "## 📝 Commits"
-            echo ""
-            echo "$LOG"
-            echo ""
-            echo "## 🐳 Docker Image"
-            echo "- Built automatically from [monochrome-music/monochrome](https://github.com/monochrome-music/monochrome)"
-            echo "- Image: \`ghcr.io/${{ github.repository }}:$NEW_TAG\`"
-            echo "- Also available as \`ghcr.io/${{ github.repository }}:latest\`"
-            echo ""
-            echo "<!-- upstream-sha: $UPSTREAM_SHA -->"
-          } > notes.md
-
-          cat notes.md
-
-      # ── Check if there is something new to release ────────────────────────
-      - name: Get current release tag
-        id: current
+      # ── 2. Derive the release tag ───────────────────────────────────────────
+      #    Format: YYYY-WNN-<short-sha>   e.g. 2026-W16-cf08290
+      - name: Derive tag
+        id: tag
         run: |
-          CURRENT=$(curl -s \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
-            | jq -r '.tag_name // "none"')
-          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          WEEK=$(date -u +%G-W%V)            # ISO week, e.g. 2026-W16
+          TAG="${WEEK}-${{ steps.upstream.outputs.short }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
 
-      - name: Check if new version exists
+      # ── 3. Check whether this tag already exists ────────────────────────────
+      - name: Check if tag already exists
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ steps.semver.outputs.version }}" = "${{ steps.current.outputs.current }}" ]; then
+          TAG="${{ steps.tag.outputs.tag }}"
+          EXISTS=$(gh api repos/${{ github.repository }}/releases/tags/$TAG \
+            --silent --jq '.tag_name' 2>/dev/null || echo "")
+          if [[ -n "$EXISTS" && "${{ inputs.force_release }}" != "true" ]]; then
+            echo "Tag $TAG already exists – skipping release."
             echo "should_release=false" >> "$GITHUB_OUTPUT"
-            echo "Version ${{ steps.semver.outputs.version }} already released — skipping."
-          elif [ "${{ steps.semver.outputs.commit_count }}" = "0" ]; then
-            echo "should_release=false" >> "$GITHUB_OUTPUT"
-            echo "No new commits — skipping."
           else
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create GitHub Release
-        if: steps.check.outputs.should_release == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.semver.outputs.version }}
-          name: Release ${{ steps.semver.outputs.version }}
-          body_path: notes.md
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  # ────────────────────────────────────────────────────────────────────────────
-  build:
-    name: Docker
-    needs: release
-    if: needs.release.outputs.should_build == 'true'
-
+  build-and-release:
+    needs: check-and-release
+    if: needs.check-and-release.outputs.should_release == 'true'
     runs-on: ubuntu-latest
 
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
+    env:
+      UPSTREAM_SHA: ${{ needs.check-and-release.outputs.upstream_sha }}
+      UPSTREAM_SHORT: ${{ needs.check-and-release.outputs.upstream_short }}
+      TAG: ${{ needs.check-and-release.outputs.tag }}
+      IMAGE: ghcr.io/${{ github.repository_owner }}/monochrome
 
     steps:
-      - name: Checkout repository
+      # ── 4. Check out upstream source at the exact commit ───────────────────
+      - name: Checkout upstream monochrome @ ${{ env.UPSTREAM_SHORT }}
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.UPSTREAM_REPO }}
-          ref: main
+          repository: monochrome-music/monochrome
+          ref: ${{ env.UPSTREAM_SHA }}
+          path: src
 
-      - name: Set version
-        run: echo "VERSION=${{ needs.release.outputs.version }}" >> "$GITHUB_ENV"
-
-      - name: Install cosign
-        if: github.event_name != 'pull_request'
-        uses: sigstore/cosign-installer@v3.8.2
-        with:
-          cosign-release: 'v2.2.4'
+      # ── 5. Set up QEMU + Buildx for multi-arch (amd64 + arm64) ─────────────
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log into registry
-        if: github.event_name != 'pull_request'
+      # ── 6. Log in to GHCR ──────────────────────────────────────────────────
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=raw,value=${{ env.VERSION }}
-            type=raw,value=latest
-          labels: |
-            org.opencontainers.image.title=monochrome
-            org.opencontainers.image.description=Open-source privacy-respecting ad-free TIDAL web UI
-            org.opencontainers.image.source=https://github.com/monochrome-music/monochrome
-            org.opencontainers.image.version=${{ env.VERSION }}
-
+      # ── 7. Build & push ────────────────────────────────────────────────────
       - name: Build and push Docker image
-        id: build-and-push
         uses: docker/build-push-action@v6
         with:
-          context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          context: src
+          file: src/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Tags: weekly release tag  +  'latest'
+          tags: |
+            ${{ env.IMAGE }}:${{ env.TAG }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/monochrome-music/monochrome
+            org.opencontainers.image.revision=${{ env.UPSTREAM_SHA }}
+            org.opencontainers.image.version=${{ env.TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # Pass all optional build-args from repo secrets (all optional)
           build-args: |
-            BUILD_VERSION=${{ env.VERSION }}
+            AUTH_ENABLED=${{ vars.AUTH_ENABLED }}
+            AUTH_SECRET=${{ secrets.AUTH_SECRET }}
+            APPWRITE_ENDPOINT=${{ vars.APPWRITE_ENDPOINT }}
+            APPWRITE_PROJECT_ID=${{ vars.APPWRITE_PROJECT_ID }}
+            POCKETBASE_URL=${{ vars.POCKETBASE_URL }}
+            SESSION_MAX_AGE=${{ vars.SESSION_MAX_AGE }}
 
-      - name: Sign Docker image
-        if: github.event_name != 'pull_request'
+      # ── 8. Fetch upstream commit message for release notes ─────────────────
+      - name: Get upstream commit details
+        id: commit_info
+        run: |
+          DATA=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/monochrome-music/monochrome/commits/${{ env.UPSTREAM_SHA }}")
+          MSG=$(echo "$DATA" | jq -r '.commit.message' | head -20)
+          AUTHOR=$(echo "$DATA" | jq -r '.commit.author.name')
+          DATE=$(echo "$DATA" | jq -r '.commit.author.date')
+          # Escape for multi-line GitHub output
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "msg<<$EOF"  >> "$GITHUB_OUTPUT"
+          echo "$MSG"       >> "$GITHUB_OUTPUT"
+          echo "$EOF"       >> "$GITHUB_OUTPUT"
+          echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
+          echo "date=$DATE"     >> "$GITHUB_OUTPUT"
+
+      # ── 9. Get recent upstream commit log for tag page ─────────────────────
+      - name: Get upstream commits since last week
+        id: commit_log
+        run: |
+          SINCE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+               || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)   # macOS fallback
+          COMMITS=$(curl -fsSL \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/monochrome-music/monochrome/commits?sha=main&since=$SINCE&per_page=50" \
+            | jq -r '.[] | "- [`\(.sha[0:7])`](https://github.com/monochrome-music/monochrome/commit/\(.sha)) \(.commit.message | split("\n")[0]) — \(.commit.author.name)"')
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "log<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "$COMMITS"  >> "$GITHUB_OUTPUT"
+          echo "$EOF"      >> "$GITHUB_OUTPUT"
+
+      # ── 10. Create GitHub Release ──────────────────────────────────────────
+      - name: Create GitHub Release
         env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-          DIGEST: ${{ steps.build-and-push.outputs.digest }}
-        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ env.TAG }}"
+          IMAGE="${{ env.IMAGE }}"
+          UPSTREAM_SHA="${{ env.UPSTREAM_SHA }}"
+          UPSTREAM_SHORT="${{ env.UPSTREAM_SHORT }}"
+
+          cat > /tmp/release-notes.md << 'NOTES_EOF'
+          ## 🎵 Monochrome — ${{ env.TAG }}
+
+          Automated weekly build from upstream [`monochrome-music/monochrome`](https://github.com/monochrome-music/monochrome).
+
+          ### 📦 Upstream commit
+
+          | Field  | Value |
+          |--------|-------|
+          | SHA    | [`${{ env.UPSTREAM_SHORT }}`](https://github.com/monochrome-music/monochrome/commit/${{ env.UPSTREAM_SHA }}) |
+          | Author | ${{ steps.commit_info.outputs.author }} |
+          | Date   | ${{ steps.commit_info.outputs.date }} |
+
+          **Commit message:**
+          ```
+          ${{ steps.commit_info.outputs.msg }}
+          ```
+
+          ### 🕐 Commits in this build window (last 7 days)
+
+          ${{ steps.commit_log.outputs.log }}
+
+          ---
+
+          ### 🐳 Docker
+
+          ```bash
+          # Latest
+          docker pull ${{ env.IMAGE }}:latest
+
+          # This exact weekly build
+          docker pull ${{ env.IMAGE }}:${{ env.TAG }}
+          ```
+
+          **Quick start:**
+          ```bash
+          docker run -d \
+            --name monochrome \
+            -p 3000:4173 \
+            --restart unless-stopped \
+            ${{ env.IMAGE }}:${{ env.TAG }}
+          ```
+          NOTES_EOF
+
+          gh release create "$TAG" \
+            --title "Monochrome $TAG" \
+            --notes-file /tmp/release-notes.md \
+            --repo "${{ github.repository }}"
