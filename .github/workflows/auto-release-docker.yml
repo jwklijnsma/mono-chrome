@@ -1,4 +1,4 @@
-name: Weekly Docker Build & Release
+name: Docker
 
 on:
   schedule:
@@ -12,12 +12,12 @@ on:
         default: 'false'
         type: boolean
 
-permissions:
-  contents: write       # create releases & tags
-  packages: write       # push to GHCR
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  check-and-release:
+  check:
     runs-on: ubuntu-latest
     outputs:
       upstream_sha: ${{ steps.upstream.outputs.sha }}
@@ -26,12 +26,8 @@ jobs:
       should_release: ${{ steps.check.outputs.should_release }}
 
     steps:
-      # ── 1. Check out fork so GITHUB_TOKEN is tied to this repo ────────────
-      #   Without this, GHCR denies write_package because the token has no
-      #   repo context. This checkout must happen before any docker login.
       - uses: actions/checkout@v4
 
-      # ── 2. Get latest upstream commit ──────────────────────────────────────
       - name: Fetch latest upstream commit
         id: upstream
         run: |
@@ -45,9 +41,7 @@ jobs:
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
           echo "Upstream HEAD: $SHA ($SHORT)"
 
-      # ── 3. Derive the release tag ───────────────────────────────────────────
-      #    Format: YYYY-WNN-<short-sha>   e.g. 2026-W16-cf08290
-      - name: Derive tag
+      - name: Derive release tag
         id: tag
         run: |
           WEEK=$(date -u +%G-W%V)
@@ -55,7 +49,6 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 
-      # ── 4. Check whether this tag already exists ────────────────────────────
       - name: Check if tag already exists
         id: check
         env:
@@ -65,94 +58,101 @@ jobs:
           EXISTS=$(gh api repos/${{ github.repository }}/releases/tags/$TAG \
             --silent --jq '.tag_name' 2>/dev/null || echo "")
           if [[ -n "$EXISTS" && "${{ inputs.force_release }}" != "true" ]]; then
-            echo "Tag $TAG already exists - skipping release."
+            echo "Tag $TAG already exists - skipping."
             echo "should_release=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  build-and-release:
-    needs: check-and-release
-    if: needs.check-and-release.outputs.should_release == 'true'
+  build:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: write
+      packages: write
+      id-token: write   # needed for cosign keyless signing
+
     env:
-      UPSTREAM_SHA:   ${{ needs.check-and-release.outputs.upstream_sha }}
-      UPSTREAM_SHORT: ${{ needs.check-and-release.outputs.upstream_short }}
-      TAG:            ${{ needs.check-and-release.outputs.tag }}
-      # GHCR image name must be all-lowercase
-      IMAGE: ghcr.io/jwklijnsma/monochrome
+      UPSTREAM_SHA:   ${{ needs.check.outputs.upstream_sha }}
+      UPSTREAM_SHORT: ${{ needs.check.outputs.upstream_short }}
+      TAG:            ${{ needs.check.outputs.tag }}
 
     steps:
-      # ── 5. Check out fork first — CRITICAL for GHCR write permission ───────
-      #   GHCR's write_package permission is granted to the GITHUB_TOKEN only
-      #   when the workflow's repo has been checked out in the same job.
-      #   Without this step the push returns "permission_denied: write_package".
-      - name: Checkout fork (GHCR token anchor)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 6. Check out upstream source at the exact commit ───────────────────
-      - name: Checkout upstream monochrome @ ${{ env.UPSTREAM_SHA }}
+      - name: Checkout upstream monochrome @ ${{ needs.check.outputs.upstream_sha }}
         uses: actions/checkout@v4
         with:
           repository: monochrome-music/monochrome
-          ref: ${{ env.UPSTREAM_SHA }}
+          ref: ${{ needs.check.outputs.upstream_sha }}
           path: src
+          fetch-depth: 1
 
-      # ── 7. Verify Dockerfile & patch for build environment ────────────────
-      #   Patches applied:
-      #   1. lockfile COPY: upstream copies package-lock.json but repo uses Bun
-      #      (bun.lock / bun.lockb). Wildcard glob handles whichever is present.
-      #   2. VITE_COMMIT_HASH: the checkout has no .git history, so git rev-parse
-      #      fails at build time. We inject the SHA directly as a build-arg.
-      - name: Verify & patch upstream Dockerfile
+      # Patch upstream Dockerfile for this build environment:
+      #  1. Lockfile: upstream copies package-lock.json but repo uses bun.lock(b)
+      #  2. git: add to apk so vite can run git rev-parse during build
+      #  3. .git: COPY .git into builder stage so git rev-parse finds the repo
+      - name: Patch upstream Dockerfile
         run: |
-          DOCKERFILE=src/docker/Dockerfile
-          echo "=== First FROM line ==="
-          grep -m1 '^FROM' "$DOCKERFILE"
+          DF=src/docker/Dockerfile
+          echo "--- FROM ---" && grep -m1 '^FROM' "$DF"
 
-          # Patch 1: lockfile wildcard
+          # 1. lockfile wildcard
           sed -i \
             's|COPY package\.json package-lock\.json \./|COPY package.json bun.lock* bun.lockb* package-lock.json* ./|' \
-            "$DOCKERFILE"
+            "$DF"
 
-          # Patch 2: inject VITE_COMMIT_HASH as a build-arg
-          #   The checkout has no .git history so git rev-parse always fails.
-          #   We pass the upstream SHA directly via --build-arg instead.
-          #   Append ARG declaration after the last existing ARG line.
-          grep -q 'VITE_COMMIT_HASH' "$DOCKERFILE" || \
-            sed -i '/^ARG SESSION_MAX_AGE/a ARG VITE_COMMIT_HASH' "$DOCKERFILE"
+          # 2. add git to apk
+          sed -i \
+            's|apk add --no-cache\(.*\)|apk add --no-cache\1 git|' \
+            "$DF"
 
-          echo "=== Patched lines ==="
-          grep -E 'COPY package|apk add' "$DOCKERFILE"
+          # 3. inject COPY .git before COPY . .
+          grep -q 'COPY \.git' "$DF" || \
+            sed -i '/^COPY \. \./i COPY .git .git' "$DF"
 
-      # ── 8. Set up Buildx ──────────────────────────────────────────────────
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+          echo "--- patched lines ---"
+          grep -E 'COPY package|apk add|COPY \.git' "$DF"
 
-      # ── 9. Log in to GHCR ──────────────────────────────────────────────────
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Install cosign
+        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
         with:
-          registry: ghcr.io
+          cosign-release: 'v2.2.4'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f95db51fddba0c2d1ec667646a06c2ce06100226 # v3.0.0
+
+      - name: Log into registry ${{ env.REGISTRY }}
+        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d # v3.0.0
+        with:
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 10. Build & push ───────────────────────────────────────────────────
+      # Produces tags:
+      #   ghcr.io/<owner>/<repo>:2026-W16-cf08290
+      #   ghcr.io/<owner>/<repo>:latest
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@96383f45573cb7f253c731d3b3ab81c87ef81934 # v5.0.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ env.TAG }}
+            type=raw,value=latest
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v6
+        id: build-and-push
+        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09 # v5.0.0
         with:
           context: src
           file: src/docker/Dockerfile
-          platforms: linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ env.TAG }}
-            ${{ env.IMAGE }}:latest
-          labels: |
-            org.opencontainers.image.source=https://github.com/monochrome-music/monochrome
-            org.opencontainers.image.revision=${{ env.UPSTREAM_SHA }}
-            org.opencontainers.image.version=${{ env.TAG }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -162,9 +162,16 @@ jobs:
             APPWRITE_PROJECT_ID=${{ vars.APPWRITE_PROJECT_ID }}
             POCKETBASE_URL=${{ vars.POCKETBASE_URL }}
             SESSION_MAX_AGE=${{ vars.SESSION_MAX_AGE }}
-            VITE_COMMIT_HASH=${{ env.UPSTREAM_SHA }}
 
-      # ── 11. Fetch upstream commit details for release notes ────────────────
+      # Sign the image digest with cosign keyless (Sigstore/Fulcio)
+      - name: Sign the published Docker image
+        env:
+          TAGS:   ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
+
+      # ── Release notes ──────────────────────────────────────────────────────
+
       - name: Get upstream commit details
         id: commit_info
         run: |
@@ -182,7 +189,6 @@ jobs:
           echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
           echo "date=$DATE"     >> "$GITHUB_OUTPUT"
 
-      # ── 12. Get upstream commits from the past 7 days ─────────────────────
       - name: Get upstream commits since last week
         id: commit_log
         run: |
@@ -197,20 +203,22 @@ jobs:
           echo "$COMMITS"    >> "$GITHUB_OUTPUT"
           echo "$DELIM"      >> "$GITHUB_OUTPUT"
 
-      # ── 13. Write release notes (Python avoids heredoc + expression issues) ─
       - name: Write release notes
         env:
           COMMIT_AUTHOR: ${{ steps.commit_info.outputs.author }}
           COMMIT_DATE:   ${{ steps.commit_info.outputs.date }}
           COMMIT_MSG:    ${{ steps.commit_info.outputs.msg }}
           COMMIT_LOG:    ${{ steps.commit_log.outputs.log }}
+          IMAGE:         ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST:        ${{ steps.build-and-push.outputs.digest }}
         run: |
           python3 - <<'PYEOF'
           import os, textwrap
           tag    = os.environ["TAG"]
-          image  = os.environ["IMAGE"]
+          image  = os.environ["IMAGE"].lower()
           sha    = os.environ["UPSTREAM_SHA"]
           short  = os.environ["UPSTREAM_SHORT"]
+          digest = os.environ["DIGEST"]
           author = os.environ.get("COMMIT_AUTHOR", "")
           date   = os.environ.get("COMMIT_DATE", "")
           msg    = os.environ.get("COMMIT_MSG", "")
@@ -242,11 +250,14 @@ jobs:
           ### Docker
 
           ```bash
+          # By tag
+          docker pull {image}:{tag}
+
+          # By immutable digest (recommended)
+          docker pull {image}@{digest}
+
           # Latest
           docker pull {image}:latest
-
-          # This exact weekly build
-          docker pull {image}:{tag}
           ```
 
           **Quick start:**
@@ -257,14 +268,15 @@ jobs:
             --restart unless-stopped \\
             {image}:{tag}
           ```
+
+          > Image is signed with [cosign](https://github.com/sigstore/cosign) keyless signing.
+          > Verify with: `cosign verify {image}:{tag} --certificate-identity-regexp='https://github.com/{os.environ.get("GITHUB_REPOSITORY", "")}' --certificate-oidc-issuer='https://token.actions.githubusercontent.com'`
           """)
           with open("/tmp/release-notes.md", "w") as f:
               f.write(notes)
-          print("Release notes written.")
           PYEOF
 
-      # ── 14. Create GitHub Release ──────────────────────────────────────────
-      - name: Publish release
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
