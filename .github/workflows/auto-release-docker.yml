@@ -26,7 +26,12 @@ jobs:
       should_release: ${{ steps.check.outputs.should_release }}
 
     steps:
-      # ── 1. Get latest upstream commit ──────────────────────────────────────
+      # ── 1. Check out fork so GITHUB_TOKEN is tied to this repo ────────────
+      #   Without this, GHCR denies write_package because the token has no
+      #   repo context. This checkout must happen before any docker login.
+      - uses: actions/checkout@v4
+
+      # ── 2. Get latest upstream commit ──────────────────────────────────────
       - name: Fetch latest upstream commit
         id: upstream
         run: |
@@ -36,21 +41,21 @@ jobs:
             https://api.github.com/repos/monochrome-music/monochrome/commits/main \
             | jq -r '.sha')
           SHORT="${SHA:0:7}"
-          echo "sha=$SHA"   >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA"     >> "$GITHUB_OUTPUT"
           echo "short=$SHORT" >> "$GITHUB_OUTPUT"
           echo "Upstream HEAD: $SHA ($SHORT)"
 
-      # ── 2. Derive the release tag ───────────────────────────────────────────
+      # ── 3. Derive the release tag ───────────────────────────────────────────
       #    Format: YYYY-WNN-<short-sha>   e.g. 2026-W16-cf08290
       - name: Derive tag
         id: tag
         run: |
-          WEEK=$(date -u +%G-W%V)            # ISO week, e.g. 2026-W16
+          WEEK=$(date -u +%G-W%V)
           TAG="${WEEK}-${{ steps.upstream.outputs.short }}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Release tag: $TAG"
 
-      # ── 3. Check whether this tag already exists ────────────────────────────
+      # ── 4. Check whether this tag already exists ────────────────────────────
       - name: Check if tag already exists
         id: check
         env:
@@ -60,7 +65,7 @@ jobs:
           EXISTS=$(gh api repos/${{ github.repository }}/releases/tags/$TAG \
             --silent --jq '.tag_name' 2>/dev/null || echo "")
           if [[ -n "$EXISTS" && "${{ inputs.force_release }}" != "true" ]]; then
-            echo "Tag $TAG already exists – skipping release."
+            echo "Tag $TAG already exists - skipping release."
             echo "should_release=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_release=true" >> "$GITHUB_OUTPUT"
@@ -72,13 +77,21 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      UPSTREAM_SHA: ${{ needs.check-and-release.outputs.upstream_sha }}
+      UPSTREAM_SHA:   ${{ needs.check-and-release.outputs.upstream_sha }}
       UPSTREAM_SHORT: ${{ needs.check-and-release.outputs.upstream_short }}
-      TAG: ${{ needs.check-and-release.outputs.tag }}
-      IMAGE: ghcr.io/${{ github.repository_owner }}/monochrome
+      TAG:            ${{ needs.check-and-release.outputs.tag }}
+      # GHCR image name must be all-lowercase
+      IMAGE: ghcr.io/jwklijnsma/monochrome
 
     steps:
-      # ── 4. Check out upstream source at the exact commit ───────────────────
+      # ── 5. Check out fork first — CRITICAL for GHCR write permission ───────
+      #   GHCR's write_package permission is granted to the GITHUB_TOKEN only
+      #   when the workflow's repo has been checked out in the same job.
+      #   Without this step the push returns "permission_denied: write_package".
+      - name: Checkout fork (GHCR token anchor)
+        uses: actions/checkout@v4
+
+      # ── 6. Check out upstream source at the exact commit ───────────────────
       - name: Checkout upstream monochrome @ ${{ env.UPSTREAM_SHA }}
         uses: actions/checkout@v4
         with:
@@ -86,30 +99,39 @@ jobs:
           ref: ${{ env.UPSTREAM_SHA }}
           path: src
 
-      # ── 4b. Verify Dockerfile and patch lock-file copy if needed ───────────
-      #   The upstream Dockerfile does:  COPY package.json package-lock.json ./
-      #   but the repo uses Bun (bun.lock / bun.lockb, no package-lock.json).
-      #   We patch the COPY line so the build never fails on a missing file,
-      #   and print the first FROM line so we can confirm which image is used.
+      # ── 7. Verify Dockerfile & patch for build environment ────────────────
+      #   Patches applied:
+      #   1. lockfile COPY: upstream copies package-lock.json but repo uses Bun
+      #      (bun.lock / bun.lockb). Wildcard glob handles whichever is present.
+      #   2. git: oven/bun:alpine has no git; vite injects commit hash at build
+      #      time via `git rev-parse`. Add git to the existing apk install line.
       - name: Verify & patch upstream Dockerfile
         run: |
           DOCKERFILE=src/docker/Dockerfile
           echo "=== First FROM line ==="
           grep -m1 '^FROM' "$DOCKERFILE"
-          echo "=== Patching lock-file COPY ==="
-          # Replace strict copy with a wildcard that works regardless of lockfile name
-          sed -i 's/COPY package\.json package-lock\.json \.\//COPY package.json bun.lock* bun.lockb* package-lock.json* .\//' "$DOCKERFILE"
-          echo "Patched COPY line:"
-          grep 'COPY package' "$DOCKERFILE"
 
-      # ── 5. Set up QEMU + Buildx for multi-arch (amd64 + arm64) ─────────────
+          # Patch 1: lockfile wildcard
+          sed -i \
+            's|COPY package\.json package-lock\.json \./|COPY package.json bun.lock* bun.lockb* package-lock.json* ./|' \
+            "$DOCKERFILE"
+
+          # Patch 2: add git to apk so vite git-hash injection does not fail
+          sed -i \
+            's|apk add --no-cache \(.*\)|apk add --no-cache \1 git|' \
+            "$DOCKERFILE"
+
+          echo "=== Patched lines ==="
+          grep -E 'COPY package|apk add' "$DOCKERFILE"
+
+      # ── 8. Set up QEMU + Buildx for multi-arch (amd64 + arm64) ─────────────
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ── 6. Log in to GHCR ──────────────────────────────────────────────────
+      # ── 9. Log in to GHCR ──────────────────────────────────────────────────
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -117,7 +139,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 7. Build & push ────────────────────────────────────────────────────
+      # ── 10. Build & push ───────────────────────────────────────────────────
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -125,7 +147,6 @@ jobs:
           file: src/docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          # Tags: weekly release tag  +  'latest'
           tags: |
             ${{ env.IMAGE }}:${{ env.TAG }}
             ${{ env.IMAGE }}:latest
@@ -135,7 +156,6 @@ jobs:
             org.opencontainers.image.version=${{ env.TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # Pass all optional build-args from repo secrets (all optional)
           build-args: |
             AUTH_ENABLED=${{ vars.AUTH_ENABLED }}
             AUTH_SECRET=${{ secrets.AUTH_SECRET }}
@@ -144,7 +164,7 @@ jobs:
             POCKETBASE_URL=${{ vars.POCKETBASE_URL }}
             SESSION_MAX_AGE=${{ vars.SESSION_MAX_AGE }}
 
-      # ── 8. Fetch upstream commit message for release notes ─────────────────
+      # ── 11. Fetch upstream commit details for release notes ────────────────
       - name: Get upstream commit details
         id: commit_info
         run: |
@@ -152,88 +172,103 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/monochrome-music/monochrome/commits/${{ env.UPSTREAM_SHA }}")
-          MSG=$(echo "$DATA" | jq -r '.commit.message' | head -20)
+          MSG=$(echo "$DATA"    | jq -r '.commit.message' | head -20)
           AUTHOR=$(echo "$DATA" | jq -r '.commit.author.name')
-          DATE=$(echo "$DATA" | jq -r '.commit.author.date')
-          # Escape for multi-line GitHub output
-          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-          echo "msg<<$EOF"  >> "$GITHUB_OUTPUT"
-          echo "$MSG"       >> "$GITHUB_OUTPUT"
-          echo "$EOF"       >> "$GITHUB_OUTPUT"
+          DATE=$(echo "$DATA"   | jq -r '.commit.author.date')
+          DELIM=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "msg<<$DELIM"    >> "$GITHUB_OUTPUT"
+          echo "$MSG"           >> "$GITHUB_OUTPUT"
+          echo "$DELIM"         >> "$GITHUB_OUTPUT"
           echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
           echo "date=$DATE"     >> "$GITHUB_OUTPUT"
 
-      # ── 9. Get recent upstream commit log for tag page ─────────────────────
+      # ── 12. Get upstream commits from the past 7 days ─────────────────────
       - name: Get upstream commits since last week
         id: commit_log
         run: |
-          SINCE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
-               || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ)   # macOS fallback
+          SINCE=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
           COMMITS=$(curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/monochrome-music/monochrome/commits?sha=main&since=$SINCE&per_page=50" \
-            | jq -r '.[] | "- [`\(.sha[0:7])`](https://github.com/monochrome-music/monochrome/commit/\(.sha)) \(.commit.message | split("\n")[0]) — \(.commit.author.name)"')
-          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-          echo "log<<$EOF" >> "$GITHUB_OUTPUT"
-          echo "$COMMITS"  >> "$GITHUB_OUTPUT"
-          echo "$EOF"      >> "$GITHUB_OUTPUT"
+            | jq -r '.[] | "- [`\(.sha[0:7])`](https://github.com/monochrome-music/monochrome/commit/\(.sha)) \(.commit.message | split("\n")[0]) -- \(.commit.author.name)"')
+          DELIM=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "log<<$DELIM" >> "$GITHUB_OUTPUT"
+          echo "$COMMITS"    >> "$GITHUB_OUTPUT"
+          echo "$DELIM"      >> "$GITHUB_OUTPUT"
 
-      # ── 10. Create GitHub Release ──────────────────────────────────────────
-      - name: Create GitHub Release
+      # ── 13. Write release notes (Python avoids heredoc + expression issues) ─
+      - name: Write release notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_AUTHOR: ${{ steps.commit_info.outputs.author }}
+          COMMIT_DATE:   ${{ steps.commit_info.outputs.date }}
+          COMMIT_MSG:    ${{ steps.commit_info.outputs.msg }}
+          COMMIT_LOG:    ${{ steps.commit_log.outputs.log }}
         run: |
-          TAG="${{ env.TAG }}"
-          IMAGE="${{ env.IMAGE }}"
-          UPSTREAM_SHA="${{ env.UPSTREAM_SHA }}"
-          UPSTREAM_SHORT="${{ env.UPSTREAM_SHORT }}"
-
-          cat > /tmp/release-notes.md << 'NOTES_EOF'
-          ## 🎵 Monochrome — ${{ env.TAG }}
+          python3 - <<'PYEOF'
+          import os, textwrap
+          tag    = os.environ["TAG"]
+          image  = os.environ["IMAGE"]
+          sha    = os.environ["UPSTREAM_SHA"]
+          short  = os.environ["UPSTREAM_SHORT"]
+          author = os.environ.get("COMMIT_AUTHOR", "")
+          date   = os.environ.get("COMMIT_DATE", "")
+          msg    = os.environ.get("COMMIT_MSG", "")
+          log    = os.environ.get("COMMIT_LOG", "_(no commits in the last 7 days)_")
+          notes = textwrap.dedent(f"""\
+          ## Monochrome {tag}
 
           Automated weekly build from upstream [`monochrome-music/monochrome`](https://github.com/monochrome-music/monochrome).
 
-          ### 📦 Upstream commit
+          ### Upstream commit
 
           | Field  | Value |
           |--------|-------|
-          | SHA    | [`${{ env.UPSTREAM_SHORT }}`](https://github.com/monochrome-music/monochrome/commit/${{ env.UPSTREAM_SHA }}) |
-          | Author | ${{ steps.commit_info.outputs.author }} |
-          | Date   | ${{ steps.commit_info.outputs.date }} |
+          | SHA    | [`{short}`](https://github.com/monochrome-music/monochrome/commit/{sha}) |
+          | Author | {author} |
+          | Date   | {date} |
 
           **Commit message:**
           ```
-          ${{ steps.commit_info.outputs.msg }}
+          {msg}
           ```
 
-          ### 🕐 Commits in this build window (last 7 days)
+          ### Commits in this build window (last 7 days)
 
-          ${{ steps.commit_log.outputs.log }}
+          {log}
 
           ---
 
-          ### 🐳 Docker
+          ### Docker
 
           ```bash
           # Latest
-          docker pull ${{ env.IMAGE }}:latest
+          docker pull {image}:latest
 
           # This exact weekly build
-          docker pull ${{ env.IMAGE }}:${{ env.TAG }}
+          docker pull {image}:{tag}
           ```
 
           **Quick start:**
           ```bash
-          docker run -d \
-            --name monochrome \
-            -p 3000:4173 \
-            --restart unless-stopped \
-            ${{ env.IMAGE }}:${{ env.TAG }}
+          docker run -d \\
+            --name monochrome \\
+            -p 3000:4173 \\
+            --restart unless-stopped \\
+            {image}:{tag}
           ```
-          NOTES_EOF
+          """)
+          with open("/tmp/release-notes.md", "w") as f:
+              f.write(notes)
+          print("Release notes written.")
+          PYEOF
 
-          gh release create "$TAG" \
-            --title "Monochrome $TAG" \
+      # ── 14. Create GitHub Release ──────────────────────────────────────────
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ env.TAG }}" \
+            --title "Monochrome ${{ env.TAG }}" \
             --notes-file /tmp/release-notes.md \
             --repo "${{ github.repository }}"
