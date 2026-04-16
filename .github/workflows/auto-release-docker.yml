@@ -26,7 +26,7 @@ jobs:
       should_release: ${{ steps.check.outputs.should_release }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Fetch latest upstream commit
         id: upstream
@@ -81,10 +81,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout upstream monochrome @ ${{ needs.check.outputs.upstream_sha }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: monochrome-music/monochrome
           ref: ${{ needs.check.outputs.upstream_sha }}
