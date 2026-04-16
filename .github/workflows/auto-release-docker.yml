@@ -93,29 +93,22 @@ jobs:
 
       # Patch upstream Dockerfile for this build environment:
       #  1. Lockfile: upstream copies package-lock.json but repo uses bun.lock(b)
-      #  2. git: add to apk so vite can run git rev-parse during build
-      #  3. .git: COPY .git into builder stage so git rev-parse finds the repo
+      #
+      #  Note: vite.config.ts calls `git rev-parse --short HEAD` but already has
+      #  a try/catch that returns 'unknown' on failure. The upstream .dockerignore
+      #  excludes .git, so we do NOT copy it — the graceful fallback is sufficient.
       - name: Patch upstream Dockerfile
         run: |
           DF=src/docker/Dockerfile
           echo "--- FROM ---" && grep -m1 '^FROM' "$DF"
 
-          # 1. lockfile wildcard
+          # lockfile wildcard (bun has no package-lock.json)
           sed -i \
             's|COPY package\.json package-lock\.json \./|COPY package.json bun.lock* bun.lockb* package-lock.json* ./|' \
             "$DF"
 
-          # 2. add git to apk
-          sed -i \
-            's|apk add --no-cache\(.*\)|apk add --no-cache\1 git|' \
-            "$DF"
-
-          # 3. inject COPY .git before COPY . .
-          grep -q 'COPY \.git' "$DF" || \
-            sed -i '/^COPY \. \./i COPY .git .git' "$DF"
-
           echo "--- patched lines ---"
-          grep -E 'COPY package|apk add|COPY \.git' "$DF"
+          grep 'COPY package' "$DF"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
